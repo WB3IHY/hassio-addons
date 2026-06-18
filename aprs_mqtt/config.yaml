@@ -1,0 +1,41 @@
+name: "APRS MQTT Tracker"
+description: "Connects to APRS-IS and publishes position data to MQTT with Home Assistant auto-discovery."
+version: "1.0.0"
+slug: "aprs_mqtt"
+init: false
+arch:
+  - aarch64
+  - armv7
+  - amd64
+  - i386
+
+options:
+  aprs_host: "rotate.aprs2.net"
+  aprs_port: 14580
+  aprs_callsign: "WB3IHY"
+  aprs_password: ""
+  callsigns:
+    - "N3EG-9"
+    - "N3EG-12"
+    - "N3EG-3"
+    - "N3EG-7"
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  mqtt_topic_prefix: "aprs"
+  poll_interval: 30
+
+schema:
+  aprs_host: str
+  aprs_port: int
+  aprs_callsign: str
+  aprs_password: str
+  callsigns:
+    - str
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_username: str
+  mqtt_password: str
+  mqtt_topic_prefix: str
+  poll_interval: int
