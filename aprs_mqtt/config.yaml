@@ -1,6 +1,6 @@
 name: "APRS MQTT Tracker"
 description: "Connects to APRS-IS and publishes position data to MQTT with Home Assistant auto-discovery."
-version: "1.0.0"
+version: "1.1.0"
 slug: "aprs_mqtt"
 init: false
 arch:
@@ -23,6 +23,7 @@ options:
   mqtt_password: ""
   mqtt_topic_prefix: "aprs"
   poll_interval: 30
+  aprsfi_api_key: ""
 
 schema:
   aprs_host: str
@@ -37,3 +38,4 @@ schema:
   mqtt_password: str
   mqtt_topic_prefix: str
   poll_interval: int
+  aprsfi_api_key: str

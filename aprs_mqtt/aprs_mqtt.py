@@ -13,6 +13,8 @@ import logging
 import threading
 import signal
 import sys
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 
 import aprslib
@@ -40,7 +42,9 @@ MQTT_PORT       = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_USERNAME   = os.environ.get("MQTT_USERNAME", "")
 MQTT_PASSWORD   = os.environ.get("MQTT_PASSWORD", "")
 MQTT_PREFIX     = os.environ.get("MQTT_TOPIC_PREFIX", "aprs")
-POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", 30))
+POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", 30))  # minutes between aprs.fi fallback polls
+APRSFI_API_KEY  = os.environ.get("APRSFI_API_KEY", "")
+APRSFI_URL      = "https://api.aprs.fi/api/get"
 
 # Parse comma-separated callsign list, normalise to uppercase
 _raw_callsigns  = os.environ.get("APRS_CALLSIGNS", "")
@@ -181,8 +185,9 @@ def publish_discovery(client: mqtt.Client, callsign: str):
     client.publish(topic, json.dumps(payload), retain=True)
     log.info(f"Published discovery for {callsign} → {topic}")
 
-def publish_position(client: mqtt.Client, callsign: str, parsed: dict):
-    """Publish state + attributes for a received APRS packet."""
+def publish_position(client: mqtt.Client, callsign: str, parsed: dict,
+                      source: str = "APRS-IS", seen_ts: str = None):
+    """Publish state + attributes for a received or polled APRS position."""
     lat  = parsed.get("latitude")
     lon  = parsed.get("longitude")
     alt  = parsed.get("altitude")          # metres
@@ -193,7 +198,7 @@ def publish_position(client: mqtt.Client, callsign: str, parsed: dict):
     sym_code = parsed.get("symbol", "?")
     via  = parsed.get("path", "")
     raw  = parsed.get("raw", "")
-    ts   = datetime.now(timezone.utc).isoformat()
+    ts   = seen_ts or datetime.now(timezone.utc).isoformat()
 
     if lat is None or lon is None:
         log.warning(f"{callsign}: packet has no position, skipping.")
@@ -225,11 +230,11 @@ def publish_position(client: mqtt.Client, callsign: str, parsed: dict):
     attrs["symbol_raw"]        = f"{sym_tbl}{sym_code}"
     attrs["via"]               = via
     attrs["last_seen"]         = ts
-    attrs["source"]            = "APRS-IS"
+    attrs["source"]            = source
 
     client.publish(attributes_topic(callsign), json.dumps(attrs), retain=True)
     log.info(
-        f"{callsign}: lat={attrs['latitude']} lon={attrs['longitude']}"
+        f"{callsign} [{source}]: lat={attrs['latitude']} lon={attrs['longitude']}"
         + (f" alt={attrs.get('altitude_ft')}ft" if 'altitude_ft' in attrs else "")
         + (f" spd={attrs.get('speed_mph')}mph" if 'speed_mph' in attrs else "")
         + (f" crs={attrs.get('course')}°" if 'course' in attrs else "")
@@ -273,6 +278,22 @@ def mqtt_connect(client: mqtt.Client):
             time.sleep(10)
 
 # ---------------------------------------------------------------------------
+# Track when each callsign was last heard live on APRS-IS, so the aprs.fi
+# fallback poller knows which callsigns still need a cached lookup.
+# ---------------------------------------------------------------------------
+_live_seen_lock = threading.Lock()
+_live_seen = {}  # callsign -> time.monotonic() of last live packet
+
+def mark_live_seen(callsign: str):
+    with _live_seen_lock:
+        _live_seen[callsign] = time.monotonic()
+
+def seconds_since_live(callsign: str):
+    with _live_seen_lock:
+        t = _live_seen.get(callsign)
+    return None if t is None else time.monotonic() - t
+
+# ---------------------------------------------------------------------------
 # APRS-IS connection
 # ---------------------------------------------------------------------------
 # Build the APRS-IS filter string from our callsign list
@@ -296,6 +317,7 @@ class APRSTracker:
         frm = parsed.get("from", "").upper()
         if frm in CALLSIGNS:
             publish_position(self.mqtt, frm, parsed)
+            mark_live_seen(frm)
 
     def _connect(self):
         filt = build_aprs_filter()
@@ -332,6 +354,95 @@ class APRSTracker:
                 pass
 
 # ---------------------------------------------------------------------------
+# aprs.fi fallback polling
+# ---------------------------------------------------------------------------
+def aprsfi_lookup(callsigns: list) -> dict:
+    """Query aprs.fi for the last-known position of each callsign.
+
+    Returns {callsign: parsed_dict} using the same keys as aprslib's parsed
+    packets (plus "lasttime"), so results can be passed to publish_position().
+    """
+    if not APRSFI_API_KEY or not callsigns:
+        return {}
+
+    query = urllib.parse.urlencode({
+        "name":   ",".join(callsigns),
+        "what":   "loc",
+        "apikey": APRSFI_API_KEY,
+        "format": "json",
+    })
+    try:
+        with urllib.request.urlopen(f"{APRSFI_URL}?{query}", timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log.warning(f"aprs.fi lookup failed: {e}")
+        return {}
+
+    if data.get("result") != "ok":
+        log.warning(f"aprs.fi lookup error: {data.get('description', data)}")
+        return {}
+
+    results = {}
+    for entry in data.get("entries", []):
+        name = entry.get("name", "").upper()
+        try:
+            lat = float(entry["lat"])
+            lon = float(entry["lng"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        symbol = entry.get("symbol") or "/?"
+        results[name] = {
+            "latitude":     lat,
+            "longitude":    lon,
+            "altitude":     float(entry["altitude"]) if entry.get("altitude") is not None else None,
+            "speed":        float(entry["speed"]) if entry.get("speed") is not None else None,
+            "course":       float(entry["course"]) if entry.get("course") is not None else None,
+            "comment":      entry.get("comment", ""),
+            "symbol_table": symbol[0] if symbol else "/",
+            "symbol":       symbol[1] if len(symbol) > 1 else "?",
+            "path":         entry.get("path", ""),
+            "lasttime":     entry.get("lasttime"),
+        }
+    return results
+
+class AprsFiPoller:
+    """Polls aprs.fi for last-known positions: once immediately at startup
+    for every configured callsign, then periodically as a fallback for
+    whichever callsigns haven't been heard live on APRS-IS recently."""
+
+    def __init__(self, mqtt_client: mqtt.Client, interval_minutes: int):
+        self.mqtt     = mqtt_client
+        self.interval = max(1, interval_minutes) * 60
+        self._stop    = threading.Event()
+
+    def _poll(self, callsigns):
+        results = aprsfi_lookup(callsigns)
+        for cs in callsigns:
+            entry = results.get(cs)
+            if not entry:
+                continue
+            lasttime = entry.pop("lasttime", None)
+            seen_ts = (
+                datetime.fromtimestamp(int(lasttime), tz=timezone.utc).isoformat()
+                if lasttime else None
+            )
+            publish_position(self.mqtt, cs, entry, source="aprs.fi", seen_ts=seen_ts)
+
+    def run(self):
+        log.info("Polling aprs.fi for initial positions...")
+        self._poll(CALLSIGNS)
+
+        while not self._stop.wait(self.interval):
+            stale = [cs for cs in CALLSIGNS
+                     if seconds_since_live(cs) is None or seconds_since_live(cs) > self.interval]
+            if stale:
+                log.info(f"Re-polling aprs.fi for stale callsigns: {', '.join(stale)}")
+                self._poll(stale)
+
+    def stop(self):
+        self._stop.set()
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -353,9 +464,19 @@ def main():
     # APRS tracker (runs in main thread)
     tracker = APRSTracker(mqtt_client)
 
+    # aprs.fi fallback poller (optional, runs in background thread)
+    aprsfi_poller = None
+    if APRSFI_API_KEY:
+        aprsfi_poller = AprsFiPoller(mqtt_client, POLL_INTERVAL)
+        threading.Thread(target=aprsfi_poller.run, daemon=True).start()
+    else:
+        log.info("aprsfi_api_key not set — skipping aprs.fi startup/fallback polling.")
+
     def shutdown(signum, frame):
         log.info("Shutting down...")
         tracker.stop()
+        if aprsfi_poller:
+            aprsfi_poller.stop()
         for cs in CALLSIGNS:
             mqtt_client.publish(availability_topic(cs), "offline", retain=True)
         time.sleep(1)
