@@ -135,7 +135,7 @@ def symbol_description(table, symbol):
     return SYMBOL_TABLE.get(key, f"APRS ({key})")
 
 # ---------------------------------------------------------------------------
-# Slug helper  (N3EG-9 → n3eg_9)
+# Slug helper  (N0CALL-9 → n0call_9)
 # ---------------------------------------------------------------------------
 def callsign_slug(callsign: str) -> str:
     return callsign.upper().replace("-", "_").lower()

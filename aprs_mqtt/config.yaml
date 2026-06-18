@@ -10,13 +10,13 @@ arch:
 options:
   aprs_host: "rotate.aprs2.net"
   aprs_port: 14580
-  aprs_callsign: "WB3IHY"
+  aprs_callsign: "N0CALL"
   aprs_password: "-1"
   callsigns:
-    - "N3EG-9"
-    - "N3EG-12"
-    - "N3EG-3"
-    - "N3EG-7"
+    - "N0CALL-9"
+    - "N0CALL-10"
+    - "N0CALL-11"
+    - "N0CALL-12"
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_username: ""
